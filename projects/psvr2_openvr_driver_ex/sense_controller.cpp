@@ -283,6 +283,7 @@ static void PollNextEvent(vr::VREvent_t *pEvent) {
 
     if (propertyEvent.prop == vr::ETrackedDeviceProperty::Prop_DisplayFrequency_Float) {
       SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+      Util::DriverLog("Display frequency changed; resetting optical controller tracking.");
     }
 
     break;

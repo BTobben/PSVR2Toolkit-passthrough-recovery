@@ -1,9 +1,12 @@
 #include "driver_hooks/hmd_device_hooks.h"
 #include "driver_interface/caesar_manager.h"
 #include "custom_share_manager.h"
+#include "sense_controller.h"
 #include "usb_thread_gaze.h"
+#include "util.h"
 
 #include <openvr_driver.h>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -14,6 +17,11 @@
 #define GAZE_MAGIC_1_STATE 'S'
 
 using namespace psvr2_toolkit;
+
+namespace {
+std::atomic<bool> gazeStreamWasActive = false;
+std::atomic<bool> gazeStreamInterrupted = false;
+}
 
 CaesarUsbThreadGaze *CaesarUsbThreadGaze::m_pInstance = nullptr;
 
@@ -58,6 +66,9 @@ int CaesarUsbThreadGaze::PollAndProcess() {
   if (result == 0) {
     // If we timed out, we should try sending the gaze enable again.
     // Entering and exiting passthrough, DP signal changes, and probably some other stuff seems to stop gaze.
+    if (gazeStreamWasActive.load() && !gazeStreamInterrupted.exchange(true)) {
+      Util::DriverLog("Gaze stream interrupted; waiting for resume before resetting optical controller tracking.");
+    }
     this->ControlCommand(true, 0x0C, nullptr, 0, 0, 0, 1);
     return 0;
   }
@@ -67,6 +78,12 @@ int CaesarUsbThreadGaze::PollAndProcess() {
   }
 
   if (state.magic[0] == GAZE_MAGIC_0 && state.magic[1] == GAZE_MAGIC_1_STATE) {
+    gazeStreamWasActive = true;
+    if (gazeStreamInterrupted.exchange(false)) {
+      SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+      Util::DriverLog("Gaze stream resumed after interruption; resetting optical controller tracking.");
+    }
+
     HmdDeviceHooks::UpdateGaze(&state, sizeof(hmd2_gaze_status_t));
     CustomShareManager *pShareManager = CustomShareManager::getSingleton();
     pShareManager->setGazeStatus(&state);
