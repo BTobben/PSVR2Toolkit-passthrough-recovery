@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <hidsdi.h>
 #include <hidpi.h>
+#include <limits>
 
 namespace psvr2_toolkit {
 
@@ -127,7 +128,8 @@ const int32_t k_prescanPhasePeriod = 32;
 const int32_t k_broadPhasePeriod = 32;
 const int32_t k_bgPhasePeriod = 20;
 const int32_t k_stablePhasePeriod = 9;
-const uint64_t k_passthroughRecoveryTimeout = 15000000;
+const uint64_t k_passthroughRecoveryRetryDelay = 2000000;
+const uint8_t k_maxCalibrationFailures = 4;
 
 enum class CalibrationState {
   Idle = -1,
@@ -152,6 +154,9 @@ struct ControllerContext {
   int32_t searchUpperBound = 16666;
   int32_t leftEdge = 0;
   int32_t rightEdge = 0;
+  uint8_t calibrationFailureCount = 0;
+  int32_t bestLatencyOffset = -1;
+  int32_t bestLatencyWindowError = std::numeric_limits<int32_t>::max();
 
   int32_t tunedCycle = 16683350; // 59.94hz. When we hit STABLE, we'll replace this.
 
@@ -241,7 +246,8 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
     if (ledCommand->payload.syncPhase.phase == LedPhase::PRESCAN && controllerCtx[controller].passthroughLedsOff.exchange(false)) {
       controllerCtx[controller].passthroughRecoveryStart = GetHostTimestamp();
       resumedAfterPassthrough = true;
-      Util::DriverLog("[{}] LED sync resumed after all-off; waiting for optical controller tracking to recover.", controllerChar);
+      SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+      Util::DriverLog("[{}] LED sync resumed after all-off; resetting optical controller tracking.", controllerChar);
     }
   }
 
@@ -359,6 +365,8 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
     ctx.lastSyncFrame = g_opticalFrameIndex[controller];
     ctx.searchLowerBound = 0;
     ctx.searchUpperBound = 16666;
+    ctx.leftEdge = 0;
+    ctx.rightEdge = 0;
     Util::DriverLog("[{}] Latency calibration has been reset.", controllerChar);
   };
 
@@ -369,11 +377,11 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
         Util::DriverLog("[{}] Optical controller tracking recovered after LED sync resumed.", controllerChar);
       }
     } else if (ctx.state == CalibrationState::Idle && senseController.IsConnected() &&
-               GetHostTimestamp() - passthroughRecoveryStart >= k_passthroughRecoveryTimeout) {
+               GetHostTimestamp() - passthroughRecoveryStart >= k_passthroughRecoveryRetryDelay) {
       uint64_t expectedRecoveryStart = passthroughRecoveryStart;
       if (ctx.passthroughRecoveryStart.compare_exchange_strong(expectedRecoveryStart, 0)) {
-        Util::DriverLog("[{}] Optical controller tracking did not recover within 15 seconds; starting one latency calibration.", controllerChar);
-        resetCalibration();
+        SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+        Util::DriverLog("[{}] Optical controller tracking did not recover within 2 seconds; retrying the lightweight optical reset once.", controllerChar);
       }
     }
   }
@@ -407,6 +415,11 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
     senseController.SetLatencyOffset(0);
     ctx.syncStartTime = GetHostTimestamp();
     ctx.lastSyncFrame = g_opticalFrameIndex[controller];
+    ctx.leftEdge = 0;
+    ctx.rightEdge = 0;
+    ctx.calibrationFailureCount = 0;
+    ctx.bestLatencyOffset = -1;
+    ctx.bestLatencyWindowError = std::numeric_limits<int32_t>::max();
   }
 
   if (ctx.state != CalibrationState::Idle && GetHostTimestamp() - ctx.syncStartTime > 300000) {
@@ -415,6 +428,35 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
     ledSync->period = k_prescanPhasePeriod;
 
     int32_t fullWindow = (ledSync->oneSubGridTime * static_cast<int32_t>(ledSync->period)) + ledSync->camExposure;
+
+    auto retryCalibration = [&]() {
+      if (ctx.rightEdge > ctx.leftEdge) {
+        int32_t candidateWindow = ctx.rightEdge - ctx.leftEdge;
+        int32_t candidateError = candidateWindow > fullWindow ? candidateWindow - fullWindow : fullWindow - candidateWindow;
+        if (candidateError < ctx.bestLatencyWindowError) {
+          ctx.bestLatencyWindowError = candidateError;
+          ctx.bestLatencyOffset = ctx.leftEdge + candidateWindow / 2;
+        }
+      }
+
+      ctx.calibrationFailureCount++;
+      if (ctx.calibrationFailureCount < k_maxCalibrationFailures) {
+        resetCalibration();
+        return;
+      }
+
+      int32_t fallbackOffset = ctx.bestLatencyOffset >= 0 ? ctx.bestLatencyOffset : 0;
+      senseController.SetLatencyOffset(fallbackOffset);
+      ctx.state = CalibrationState::Idle;
+      ctx.lastSync = 0;
+      SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+      if (ctx.bestLatencyOffset >= 0) {
+        Util::DriverLog("[{}] Latency calibration reached the retry limit; using best measured offset {} (window error {}).", controllerChar,
+                        fallbackOffset, ctx.bestLatencyWindowError);
+      } else {
+        Util::DriverLog("[{}] Latency calibration reached the retry limit without a usable LED window; stopping at offset 0.", controllerChar);
+      }
+    };
 
     if (g_opticalFrameIndex[controller] - ctx.lastSyncFrame >= 4) {
       int32_t newLatencyOffset = 0;
@@ -442,7 +484,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
           ctx.searchLowerBound = newLatencyOffset;
           if (ctx.searchUpperBound - ctx.searchLowerBound < fullWindow / 2) {
             Util::DriverLog("[{}] Could not find an initial on point.", controllerChar);
-            resetCalibration();
+            retryCalibration();
           }
           break;
         }
@@ -497,7 +539,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       case CalibrationState::ConfirmLeftEdgeOuter:
         if (currentLedCount > ctx.thresholdLedCount) { // Should be off
           Util::DriverLog("[{}] Left edge confirmation failed (outer).", controllerChar);
-          resetCalibration();
+          retryCalibration();
           break;
         }
         Util::DriverLog("[{}] Left edge confirmation passed (outer).", controllerChar);
@@ -508,7 +550,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       case CalibrationState::ConfirmLeftEdgeInner:
         if (currentLedCount <= ctx.thresholdLedCount) { // Should be on
           Util::DriverLog("[{}] Left edge confirmation failed (inner).", controllerChar);
-          resetCalibration();
+          retryCalibration();
           break;
         }
         Util::DriverLog("[{}] Left edge confirmation passed (inner).", controllerChar);
@@ -519,7 +561,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       case CalibrationState::ConfirmRightEdgeOuter:
         if (currentLedCount > ctx.thresholdLedCount) { // Should be off
           Util::DriverLog("[{}] Right edge confirmation failed (outer).", controllerChar);
-          resetCalibration();
+          retryCalibration();
           break;
         }
         Util::DriverLog("[{}] Right edge confirmation passed (outer).", controllerChar);
@@ -530,7 +572,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       case CalibrationState::ConfirmRightEdgeInner:
         if (currentLedCount <= ctx.thresholdLedCount) { // Should be on
           Util::DriverLog("[{}] Right edge confirmation failed (inner).", controllerChar);
-          resetCalibration();
+          retryCalibration();
           break;
         }
         Util::DriverLog("[{}] Right edge confirmation passed (inner).", controllerChar);
@@ -543,6 +585,9 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
         int32_t finalOffset = ctx.leftEdge + (ctx.rightEdge - ctx.leftEdge) / 2;
 
         senseController.SetLatencyOffset(finalOffset);
+        ctx.calibrationFailureCount = 0;
+        ctx.bestLatencyOffset = -1;
+        ctx.bestLatencyWindowError = std::numeric_limits<int32_t>::max();
 
         Util::DriverLog("[{}] Final latency offset: {} microseconds. LED on time: actual: {} expected: {}", controllerChar, finalOffset,
                         ctx.rightEdge - ctx.leftEdge, fullWindow);
@@ -598,11 +643,13 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       ctx.thresholdLedCount = currentLedCount + 3;
     }
   } else if (GetHostTimestamp() - ctx.lastSync < 500000) {
-    // If we haven't tracked in the last half of a second, reset the calibration.
+    // A freshly calibrated controller can briefly lose optical lock. Keep the measured
+    // latency and reset only the optical tracker instead of entering an LED calibration loop.
     if (!isTracking && static_cast<int64_t>(GetHostTimestamp() - lastTrackedTimestamp) > 500000) {
-      Util::DriverLog("[{}] Reset latency calibration due to controller not tracking. {}", controllerChar,
+      Util::DriverLog("[{}] Controller did not track after latency calibration; resetting optical tracking once. {}", controllerChar,
                       static_cast<int64_t>(GetHostTimestamp() - lastTrackedTimestamp));
-      resetCalibration();
+      ctx.lastSync = 0;
+      SenseController::g_ShouldResetLEDTrackingInTicks = 150;
     }
   }
 
