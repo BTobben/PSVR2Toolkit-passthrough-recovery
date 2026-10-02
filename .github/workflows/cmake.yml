@@ -37,6 +37,12 @@ jobs:
       with:
         submodules: recursive
     
+    - name: Test optical recovery lifecycle (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        g++ -std=c++17 -Wall -Wextra -Werror tests/optical_recovery_test.cpp -o /tmp/optical-recovery-test
+        /tmp/optical-recovery-test
+
     # Most of these are SDL3 dependencies https://wiki.libsdl.org/SDL3/README-linux#build-dependencies
     - name: Install dependencies (Linux)
       if: runner.os == 'Linux'
