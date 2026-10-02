@@ -275,11 +275,11 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
 
     if (ledCommand->payload.syncPhase.phase == LedPhase::PRESCAN) {
       ledCommand->payload.syncPhase.frameCycle = controllerCtx[controller].tunedCycle;
-      Util::DriverLog("SET_SYNC_PHASE: phase={}, period={}, frameCycle={}, leds=[{},{},{},{}] {}", ledCommand->payload.syncPhase.phase,
+      Util::DriverLog("[{}] SET_SYNC_PHASE: phase={}, period={}, frameCycle={}, leds=[{},{},{},{}] {}", controllerChar, ledCommand->payload.syncPhase.phase,
                       ledCommand->payload.syncPhase.period, ledCommand->payload.syncPhase.frameCycle, ledCommand->payload.syncPhase.leds[0],
                       ledCommand->payload.syncPhase.leds[1], ledCommand->payload.syncPhase.leds[2], ledCommand->payload.syncPhase.leds[3], commandSize);
     } else {
-      Util::DriverLog("SET_SYNC_PHASE: phase={}, period={}, offset={}, leds=[{},{},{},{}] {}", ledCommand->payload.syncPhase.phase,
+      Util::DriverLog("[{}] SET_SYNC_PHASE: phase={}, period={}, offset={}, leds=[{},{},{},{}] {}", controllerChar, ledCommand->payload.syncPhase.phase,
                       ledCommand->payload.syncPhase.period, ledCommand->payload.syncPhase.offset, ledCommand->payload.syncPhase.leds[0],
                       ledCommand->payload.syncPhase.leds[1], ledCommand->payload.syncPhase.leds[2], ledCommand->payload.syncPhase.leds[3], commandSize);
     }
@@ -574,17 +574,22 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       libpad_SetSyncLedCommand(timeSync, ledSync, &command,
                                sizeof(command.type) + sizeof(command.payload.syncPhase) - sizeof(command.payload.syncPhase.frameCycle), timeSync->isLeft);
 
-      Util::DriverLog("[{}] Active optical tracking has been lost for {} microseconds; requesting one controller-local LED resync (LED count {}).",
+      Util::DriverLog("[{}] Tracking still lost after Sony IR resume for {} microseconds; requesting one controller-local LED resync (LED count {}).",
                       controllerChar, recovery.lossDuration, currentLedCount);
       break;
     }
+    case OpticalRecoveryAction::ObserveLoss:
+      Util::DriverLog("[{}] Ordinary optical loss for {} microseconds; observing without extra LED resync (LED count {}, phase {}, latency {}).",
+                      controllerChar, recovery.lossDuration, currentLedCount, static_cast<int>(ledSync->phase), latencyOffset);
+      break;
     case OpticalRecoveryAction::Stalled:
-      Util::DriverLog("[{}] Optical tracking still lost {} microseconds after controller-local LED resync (active loss {} microseconds, LED count {}).",
-                      controllerChar, recovery.sinceResync, recovery.lossDuration, currentLedCount);
+      Util::DriverLog("[{}] Optical tracking still lost for {} microseconds (extra resync {}, since resync {} microseconds, LED count {}, phase {}, latency {}).",
+                      controllerChar, recovery.lossDuration, recovery.resyncIssued, recovery.sinceResync, currentLedCount,
+                      static_cast<int>(ledSync->phase), latencyOffset);
       break;
     case OpticalRecoveryAction::Recovered:
-      Util::DriverLog("[{}] Optical controller tracking recovered {} microseconds after controller-local LED resync (active loss {} microseconds).",
-                      controllerChar, recovery.sinceResync, recovery.lossDuration);
+      Util::DriverLog("[{}] Optical controller tracking recovered after {} microseconds (extra resync {}, since resync {} microseconds).",
+                      controllerChar, recovery.lossDuration, recovery.resyncIssued, recovery.sinceResync);
       break;
     case OpticalRecoveryAction::None:
       break;

@@ -28,30 +28,34 @@ private:
   std::atomic<uint64_t> state{0};
 };
 
-enum class OpticalRecoveryAction { None, Resync, Stalled, Recovered };
+enum class OpticalRecoveryAction { None, ObserveLoss, Resync, Stalled, Recovered };
 
 struct OpticalRecoveryResult {
   OpticalRecoveryAction action = OpticalRecoveryAction::None;
   uint64_t lossDuration = 0;
   uint64_t sinceResync = 0;
+  bool resyncIssued = false;
 };
 
 // Updated only under libpad's LED base-time hook mutex. No hardware operations
-// here: one resync per eligible loss episode, rearmed after an activity change.
+// here: ordinary loss (including occlusion) is observation-only. At most one
+// extra resync is allowed after Sony resumes IR, until tracking first returns.
 class OpticalRecovery {
 public:
   OpticalRecoveryResult Update(uint64_t now, uint64_t activity, bool eligible, bool tracking) {
-    if (activity != lastActivity || !eligible || (activity & 1)) {
+    if (activity != lastActivity) {
       Reset();
+      resumeArmed = (activity & 1) == 0;
     }
     lastActivity = activity;
     if (!eligible || (activity & 1)) {
+      Reset();
       return {};
     }
     if (tracking) {
       OpticalRecoveryResult result;
-      if (resyncIssued) {
-        result = {OpticalRecoveryAction::Recovered, now - lossStart, now - resyncTime};
+      if (lossAnnounced) {
+        result = {OpticalRecoveryAction::Recovered, now - lossStart, resyncIssued ? now - resyncTime : 0, resyncIssued};
       }
       Reset();
       return result;
@@ -61,14 +65,20 @@ public:
       lossStart = now;
     }
     const uint64_t lossDuration = now - lossStart;
-    if (!resyncIssued && lossDuration >= 500000) {
-      resyncIssued = true;
-      resyncTime = now;
-      return {OpticalRecoveryAction::Resync, lossDuration, 0};
+    if (!lossAnnounced && lossDuration >= 500000) {
+      lossAnnounced = true;
+      if (resumeArmed) {
+        resumeArmed = false;
+        resyncIssued = true;
+        resyncTime = now;
+        return {OpticalRecoveryAction::Resync, lossDuration, 0, true};
+      }
+      return {OpticalRecoveryAction::ObserveLoss, lossDuration, 0, false};
     }
-    if (resyncIssued && !stallReported && now - resyncTime >= 5000000) {
+    const uint64_t stallStart = resyncIssued ? resyncTime : lossStart;
+    if (lossAnnounced && !stallReported && now - stallStart >= 5000000) {
       stallReported = true;
-      return {OpticalRecoveryAction::Stalled, lossDuration, now - resyncTime};
+      return {OpticalRecoveryAction::Stalled, lossDuration, resyncIssued ? now - resyncTime : 0, resyncIssued};
     }
     return {};
   }
@@ -76,6 +86,8 @@ public:
 private:
   void Reset() {
     lossActive = false;
+    lossAnnounced = false;
+    resumeArmed = false;
     resyncIssued = false;
     stallReported = false;
   }
@@ -84,6 +96,8 @@ private:
   uint64_t lossStart = 0;
   uint64_t resyncTime = 0;
   bool lossActive = false;
+  bool lossAnnounced = false;
+  bool resumeArmed = false;
   bool resyncIssued = false;
   bool stallReported = false;
 };

@@ -14,14 +14,15 @@ int main() {
     return controller.Update(now, activity.Snapshot(), eligible, tracking);
   };
 
-  // Exact thresholds, one request and one stall report per continuous loss.
+  // Ordinary occlusion never requests an extra resync, even after a long loss.
   assert(step(left, 0).action == Action::None);
   assert(step(left, 499999).action == Action::None);
-  assert(step(left, 500000).action == Action::Resync);
-  assert(step(left, 5499999).action == Action::None);
-  auto stalled = step(left, 5500000);
+  auto loss = step(left, 500000);
+  assert(loss.action == Action::ObserveLoss && !loss.resyncIssued);
+  assert(step(left, 4999999).action == Action::None);
+  auto stalled = step(left, 5000000);
   assert(stalled.action == Action::Stalled);
-  assert(stalled.lossDuration == 5500000 && stalled.sinceResync == 5000000);
+  assert(stalled.lossDuration == 5000000 && stalled.sinceResync == 0 && !stalled.resyncIssued);
   assert(step(left, 60000000).action == Action::None);
   // The other controller's state is independent.
   assert(step(right, 60000000, true, true).action == Action::None);
@@ -40,12 +41,12 @@ int main() {
   assert(step(left, 362500000).action == Action::Resync);
   auto recovered = step(left, 362750000, true, true);
   assert(recovered.action == Action::Recovered);
-  assert(recovered.lossDuration == 750000 && recovered.sinceResync == 250000);
+  assert(recovered.lossDuration == 750000 && recovered.sinceResync == 250000 && recovered.resyncIssued);
   assert(step(left, 363000000, true, true).action == Action::None);
 
-  // A later genuine loss gets a fresh bounded attempt.
+  // Reacquisition disarms resume recovery: later occlusion is passive again.
   assert(step(left, 364000000).action == Action::None);
-  assert(step(left, 364500000).action == Action::Resync);
+  assert(step(left, 364500000).action == Action::ObserveLoss);
 
   // Off/on can happen between hook updates. The epoch must still rearm.
   assert(activity.SetSuspended(true));
@@ -63,16 +64,49 @@ int main() {
   // Disconnect / calibration / missing timestamp offset cancel an episode.
   assert(step(left, 368000000, false).action == Action::None);
   assert(step(left, 369000000).action == Action::None);
-  assert(step(left, 369500000).action == Action::Resync);
+  assert(step(left, 369500000).action == Action::ObserveLoss);
   assert(step(left, 370000000, false, true).action == Action::None);
   assert(step(left, 371000000).action == Action::None);
-  assert(step(left, 371500000).action == Action::Resync);
+  assert(step(left, 371500000).action == Action::ObserveLoss);
 
   // Inactivity is never reported as a successful controller recovery.
   assert(activity.SetSuspended(true));
   assert(step(left, 372000000, true, true).action == Action::None);
   assert(activity.SetSuspended(false));
   assert(step(left, 373000000, true, true).action == Action::None);
+
+  // If Sony reacquires promptly after resume, there must be no later resync.
+  assert(step(left, 374000000).action == Action::None);
+  assert(step(left, 374500000).action == Action::ObserveLoss);
+  auto naturalRecovery = step(left, 375000000, true, true);
+  assert(naturalRecovery.action == Action::Recovered);
+  assert(!naturalRecovery.resyncIssued && naturalRecovery.sinceResync == 0);
+  assert(naturalRecovery.lossDuration == 1000000);
+
+  // Resume recovery is still single-shot, with bounded diagnostic logging.
+  assert(activity.SetSuspended(true));
+  assert(activity.SetSuspended(false));
+  assert(step(left, 376000000).action == Action::None);
+  assert(step(left, 376500000).action == Action::Resync);
+  assert(step(left, 381499999).action == Action::None);
+  auto resumeStall = step(left, 381500000);
+  assert(resumeStall.action == Action::Stalled && resumeStall.resyncIssued);
+  assert(resumeStall.sinceResync == 5000000);
+  assert(step(left, 500000000).action == Action::None);
+
+  // A calibration/disconnect during resume cancels that recovery arm.
+  assert(activity.SetSuspended(true));
+  assert(activity.SetSuspended(false));
+  assert(step(left, 501000000, false).action == Action::None);
+  assert(step(left, 502000000).action == Action::None);
+  assert(step(left, 502500000).action == Action::ObserveLoss);
+
+  // Sub-half-second occlusions are neither reset nor logged as long losses.
+  OpticalRecovery shortLoss;
+  assert(shortLoss.Update(0, 0, true, false).action == Action::None);
+  assert(shortLoss.Update(400000, 0, true, true).action == Action::None);
+  assert(shortLoss.Update(500000, 0, true, false).action == Action::None);
+  assert(shortLoss.Update(900000, 0, true, true).action == Action::None);
 
   std::cout << "OPTICAL_RECOVERY_TESTS_PASSED\n";
 }
