@@ -127,7 +127,6 @@ const int32_t k_prescanPhasePeriod = 32;
 const int32_t k_broadPhasePeriod = 32;
 const int32_t k_bgPhasePeriod = 20;
 const int32_t k_stablePhasePeriod = 9;
-const uint64_t k_passthroughRecoveryTimeout = 15000000;
 
 enum class CalibrationState {
   Idle = -1,
@@ -155,8 +154,7 @@ struct ControllerContext {
 
   int32_t tunedCycle = 16683350; // 59.94hz. When we hit STABLE, we'll replace this.
 
-  std::atomic<bool> passthroughLedsOff = false;
-  std::atomic<uint64_t> passthroughRecoveryStart = 0;
+  std::atomic<bool> passthroughLedHoldActive = false;
 };
 static ControllerContext controllerCtx[2];
 std::atomic<int32_t> g_controllerLedCount[2] = {0, 0};
@@ -224,6 +222,20 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
 
   int32_t controller = isLeft ? 1 : 0;
   char controllerChar = isLeft ? 'L' : 'R';
+
+  if (ledCommand->type == CommandType::SET_SYNC_PHASE) {
+    if (ledCommand->payload.syncPhase.phase == LedPhase::LED_ALL_OFF) {
+      if (!controllerCtx[controller].passthroughLedHoldActive.exchange(true)) {
+        Util::DriverLog("[{}] Holding the current IR LED phase through passthrough to preserve optical tracking.", controllerChar);
+      }
+      return;
+    }
+
+    if (controllerCtx[controller].passthroughLedHoldActive.exchange(false)) {
+      Util::DriverLog("[{}] Passthrough ended; resuming normal IR LED synchronization.", controllerChar);
+    }
+  }
+
   if (controllerCtx[controller].state != CalibrationState::Idle) {
     // Don't allow the driver to issue LED commands while calibrating.
     return;
@@ -231,14 +243,6 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
 
   switch (ledCommand->type) {
   case CommandType::SET_SYNC_PHASE:
-    if (ledCommand->payload.syncPhase.phase == LedPhase::LED_ALL_OFF) {
-      controllerCtx[controller].passthroughLedsOff = true;
-      controllerCtx[controller].passthroughRecoveryStart = 0;
-    } else if (ledCommand->payload.syncPhase.phase == LedPhase::PRESCAN && controllerCtx[controller].passthroughLedsOff.exchange(false)) {
-      controllerCtx[controller].passthroughRecoveryStart = GetHostTimestamp();
-      Util::DriverLog("[{}] LED sync resumed after all-off; waiting for optical controller tracking to recover.", controllerChar);
-    }
-
     // Use lower LED period time for better battery life.
     switch (ledCommand->payload.syncPhase.phase) {
     case LedPhase::PRESCAN:
@@ -333,22 +337,6 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
     ctx.searchUpperBound = 16666;
     Util::DriverLog("[{}] Latency calibration has been reset.", controllerChar);
   };
-
-  uint64_t passthroughRecoveryStart = ctx.passthroughRecoveryStart.load();
-  if (passthroughRecoveryStart != 0) {
-    if (isTracking && lastTrackedTimestamp >= passthroughRecoveryStart) {
-      if (ctx.passthroughRecoveryStart.exchange(0) != 0) {
-        Util::DriverLog("[{}] Optical controller tracking recovered after LED sync resumed.", controllerChar);
-      }
-    } else if (ctx.state == CalibrationState::Idle && senseController.IsConnected() &&
-               GetHostTimestamp() - passthroughRecoveryStart >= k_passthroughRecoveryTimeout) {
-      uint64_t expectedRecoveryStart = passthroughRecoveryStart;
-      if (ctx.passthroughRecoveryStart.compare_exchange_strong(expectedRecoveryStart, 0)) {
-        Util::DriverLog("[{}] Optical controller tracking did not recover within 15 seconds; starting one latency calibration.", controllerChar);
-        resetCalibration();
-      }
-    }
-  }
 
   int32_t currentLedCount = g_controllerLedCount[controller];
 
