@@ -127,6 +127,8 @@ const int32_t k_prescanPhasePeriod = 32;
 const int32_t k_broadPhasePeriod = 32;
 const int32_t k_bgPhasePeriod = 20;
 const int32_t k_stablePhasePeriod = 9;
+const uint64_t k_opticalRecoveryDelay = 500000;
+const uint64_t k_opticalRecoveryStallReportDelay = 5000000;
 
 enum class CalibrationState {
   Idle = -1,
@@ -155,6 +157,9 @@ struct ControllerContext {
   int32_t tunedCycle = 16683350; // 59.94hz. When we hit STABLE, we'll replace this.
 
   std::atomic<bool> passthroughLedHoldActive = false;
+  uint64_t opticalLossStart = 0;
+  bool opticalResetIssuedForLoss = false;
+  bool opticalRecoveryStallReported = false;
 };
 static ControllerContext controllerCtx[2];
 std::atomic<int32_t> g_controllerLedCount[2] = {0, 0};
@@ -557,12 +562,40 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
     if (ctx.state == CalibrationState::Start) {
       ctx.thresholdLedCount = currentLedCount + 3;
     }
-  } else if (GetHostTimestamp() - ctx.lastSync < 500000) {
-    // If we haven't tracked in the last half of a second, reset the calibration.
-    if (!isTracking && static_cast<int64_t>(GetHostTimestamp() - lastTrackedTimestamp) > 500000) {
-      Util::DriverLog("[{}] Reset latency calibration due to controller not tracking. {}", controllerChar,
-                      static_cast<int64_t>(GetHostTimestamp() - lastTrackedTimestamp));
-      resetCalibration();
+  } else {
+    uint64_t now = GetHostTimestamp();
+
+    if (isTracking) {
+      if (ctx.opticalResetIssuedForLoss) {
+        Util::DriverLog("[{}] Optical controller tracking recovered {} microseconds after loss.", controllerChar, now - ctx.opticalLossStart);
+      }
+
+      ctx.opticalLossStart = 0;
+      ctx.opticalResetIssuedForLoss = false;
+      ctx.opticalRecoveryStallReported = false;
+    } else if (!senseController.IsConnected() || !hasTimeOffset || latencyOffset < 0) {
+      // A disconnect or unfinished time/latency setup starts a new recovery episode.
+      ctx.opticalLossStart = 0;
+      ctx.opticalResetIssuedForLoss = false;
+      ctx.opticalRecoveryStallReported = false;
+    } else {
+      if (ctx.opticalLossStart == 0) {
+        ctx.opticalLossStart = now;
+      }
+
+      uint64_t lossDuration = now - ctx.opticalLossStart;
+      if (!ctx.opticalResetIssuedForLoss && lossDuration >= k_opticalRecoveryDelay) {
+        ctx.opticalResetIssuedForLoss = true;
+        SenseController::g_ShouldResetLEDTrackingInTicks = 150;
+        Util::DriverLog("[{}] Optical tracking has been lost for {} microseconds; requesting one lightweight tracker reset (LED count {}).",
+                        controllerChar, lossDuration, currentLedCount);
+      } else if (ctx.opticalResetIssuedForLoss && !ctx.opticalRecoveryStallReported &&
+                 lossDuration >= k_opticalRecoveryStallReportDelay) {
+        ctx.opticalRecoveryStallReported = true;
+        uint64_t sinceLastTrack = lastTrackedTimestamp == 0 || now < lastTrackedTimestamp ? 0 : now - lastTrackedTimestamp;
+        Util::DriverLog("[{}] Optical tracking is still lost after {} microseconds (last tracked {} microseconds ago, LED count {}).",
+                        controllerChar, lossDuration, sinceLastTrack, currentLedCount);
+      }
     }
   }
 
