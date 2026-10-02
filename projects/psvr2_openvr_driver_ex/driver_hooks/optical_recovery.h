@@ -9,6 +9,8 @@ namespace psvr2_toolkit {
 // passthrough. Retain a generation so an off/on pair between updates is seen.
 class OpticalActivity {
 public:
+  explicit OpticalActivity(bool initiallySuspended = false) : state(initiallySuspended ? 1 : 0) {}
+
   bool SetSuspended(bool suspended) {
     uint64_t previous = state.load();
     for (;;) {
@@ -25,7 +27,7 @@ public:
   uint64_t Snapshot() const { return state.load(); }
 
 private:
-  std::atomic<uint64_t> state{0};
+  std::atomic<uint64_t> state;
 };
 
 enum class OpticalRecoveryAction { None, ObserveLoss, Resync, Stalled, Recovered };
@@ -42,13 +44,14 @@ struct OpticalRecoveryResult {
 // extra resync is allowed after Sony resumes IR, until tracking first returns.
 class OpticalRecovery {
 public:
-  OpticalRecoveryResult Update(uint64_t now, uint64_t activity, bool eligible, bool tracking) {
-    if (activity != lastActivity) {
+  OpticalRecoveryResult Update(uint64_t now, uint64_t activity, bool eligible, bool tracking, uint64_t displayActivity = 0) {
+    if (activity != lastActivity || displayActivity != lastDisplayActivity) {
       Reset();
-      resumeArmed = (activity & 1) == 0;
+      resumeArmed = ((activity | displayActivity) & 1) == 0;
     }
     lastActivity = activity;
-    if (!eligible || (activity & 1)) {
+    lastDisplayActivity = displayActivity;
+    if (!eligible || ((activity | displayActivity) & 1)) {
       Reset();
       return {};
     }
@@ -93,6 +96,7 @@ private:
   }
 
   uint64_t lastActivity = 0;
+  uint64_t lastDisplayActivity = 0;
   uint64_t lossStart = 0;
   uint64_t resyncTime = 0;
   bool lossActive = false;

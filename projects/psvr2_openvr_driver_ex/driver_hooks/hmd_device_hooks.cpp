@@ -2,6 +2,7 @@
 #include "driver_interface/config_manager.h"
 #include "driver_interface/share_manager.h"
 #include "driver_host_proxy.h"
+#include "driver_properties_proxy.h"
 #include "hmd2_gaze.h"
 #include "hmd_device_camera.h"
 #include "hmd_device_hooks.h"
@@ -27,6 +28,8 @@ vr::EVRInitError sie__psvr2__HmdDevice__ActivateHook(void *thisptr, uint32_t unO
   vr::PropertyContainerHandle_t ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(unObjectId);
 
   DriverHostProxy::Instance()->SetDevice(DeviceType::HMD, ulPropertyContainer, unObjectId);
+  DriverPropertiesProxy::Instance().TrackHmd(result == vr::VRInitError_None ? ulPropertyContainer : vr::k_ulInvalidPropertyContainer,
+                                           vr::VRPropertiesRaw());
 
   // Sony driver only defines the standard hidden area mesh.
   // OpenVR and OpenXR applications can ask for other types
@@ -226,7 +229,10 @@ vr::EVRInitError sie__psvr2__HmdDevice__ActivateHook(void *thisptr, uint32_t unO
 }
 
 void (*sie__psvr2__HmdDevice__Deactivate)(void *) = nullptr;
-void sie__psvr2__HmdDevice__DeactivateHook(void *thisptr) { sie__psvr2__HmdDevice__Deactivate(thisptr); }
+void sie__psvr2__HmdDevice__DeactivateHook(void *thisptr) {
+  DriverPropertiesProxy::Instance().TrackHmd(vr::k_ulInvalidPropertyContainer, vr::VRPropertiesRaw());
+  sie__psvr2__HmdDevice__Deactivate(thisptr);
+}
 
 void *(*sie__psvr2__HmdDevice__GetComponent)(void *, char *) = nullptr;
 void *sie__psvr2__HmdDevice__GetComponentHook(void *thisptr, char *pchComponentNameAndVersion) {

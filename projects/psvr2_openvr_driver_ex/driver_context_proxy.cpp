@@ -1,6 +1,7 @@
 #include "driver_context_proxy.h"
 
 #include "driver_host_proxy.h"
+#include "driver_properties_proxy.h"
 
 namespace psvr2_toolkit {
 
@@ -20,6 +21,12 @@ void DriverContextProxy::SetDriverContext(vr::IVRDriverContext *pDriverContext) 
 
 void *DriverContextProxy::GetGenericInterface(const char *pchInterfaceVersion, vr::EVRInitError *peError) {
   void *result = m_pDriverContext->GetGenericInterface(pchInterfaceVersion, peError);
+
+  if (result && strcmp(vr::IVRProperties_Version, pchInterfaceVersion) == 0) {
+    auto &proxy = DriverPropertiesProxy::Instance();
+    proxy.SetProperties(static_cast<vr::IVRProperties *>(result));
+    return &proxy;
+  }
 
   // Depends on our OpenVR driver SDK version matching the one inside the PS VR2 driver.
   if (strcmp(vr::IVRServerDriverHost_Version, pchInterfaceVersion) == 0) {

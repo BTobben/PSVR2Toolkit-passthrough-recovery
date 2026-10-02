@@ -1,5 +1,6 @@
 #include "libpad_hooks.h"
 #include "optical_recovery.h"
+#include "driver_properties_proxy.h"
 
 #include "hmd_driver_loader.h"
 #include "utils/hook_lib.h"
@@ -233,7 +234,7 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
     }
 
     if (controllerCtx[controller].opticalActivity.SetSuspended(false)) {
-      Util::DriverLog("[{}] Sony resumed IR synchronization; rearming controller-local optical recovery.", controllerChar);
+      Util::DriverLog("[{}] Sony resumed IR synchronization; extra recovery also requires confirmed normal display mode.", controllerChar);
     }
   }
 
@@ -371,9 +372,17 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
   }
 
   const uint64_t recoveryNow = GetHostTimestamp();
+  const uint64_t displayActivity = DriverPropertiesProxy::Instance().DisplayActivity();
+  static uint64_t previousDisplayActivity = UINT64_MAX;
+  if (displayActivity != previousDisplayActivity) {
+    Util::DriverLog("Optical recovery display gate: {} (generation {}).",
+                    (displayActivity & 1) ? "blocked: passthrough or unknown HMD mode" : "ready: all three Sony mode properties are false",
+                    displayActivity >> 1);
+    previousDisplayActivity = displayActivity;
+  }
   const auto recovery = ctx.opticalRecovery.Update(
       recoveryNow, ctx.opticalActivity.Snapshot(),
-      ctx.state == CalibrationState::Idle && senseController.IsConnected() && hasTimeOffset && latencyOffset >= 0, isTracking);
+      ctx.state == CalibrationState::Idle && senseController.IsConnected() && hasTimeOffset && latencyOffset >= 0, isTracking, displayActivity);
 
   if (ctx.state != CalibrationState::Idle && GetHostTimestamp() - ctx.syncStartTime > 300000) {
     // Force to PRESCAN phase while calibrating.
@@ -574,7 +583,7 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
       libpad_SetSyncLedCommand(timeSync, ledSync, &command,
                                sizeof(command.type) + sizeof(command.payload.syncPhase) - sizeof(command.payload.syncPhase.frameCycle), timeSync->isLeft);
 
-      Util::DriverLog("[{}] Tracking still lost after Sony IR resume for {} microseconds; requesting one controller-local LED resync (LED count {}).",
+      Util::DriverLog("[{}] Tracking still lost after IR and normal-display resume for {} microseconds; requesting one controller-local LED resync (LED count {}).",
                       controllerChar, recovery.lossDuration, currentLedCount);
       break;
     }

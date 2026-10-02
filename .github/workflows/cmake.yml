@@ -42,6 +42,8 @@ jobs:
       run: |
         g++ -std=c++17 -Wall -Wextra -Werror tests/optical_recovery_test.cpp -o /tmp/optical-recovery-test
         /tmp/optical-recovery-test
+        g++ -std=c++17 -Wall -Wextra -Werror -isystem externals/openvr/headers tests/driver_properties_proxy_test.cpp -o /tmp/driver-properties-proxy-test
+        /tmp/driver-properties-proxy-test
 
     # Most of these are SDL3 dependencies https://wiki.libsdl.org/SDL3/README-linux#build-dependencies
     - name: Install dependencies (Linux)

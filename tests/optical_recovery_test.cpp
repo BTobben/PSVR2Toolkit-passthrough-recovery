@@ -108,5 +108,61 @@ int main() {
   assert(shortLoss.Update(500000, 0, true, false).action == Action::None);
   assert(shortLoss.Update(900000, 0, true, true).action == Action::None);
 
+  // Replay the observed ordering: Sony resumes IR ~1.4 s before all the
+  // display-mode properties become false. No recovery timer runs in that gap.
+  OpticalActivity ir;
+  OpticalActivity display(true); // unknown HMD mode is blocked
+  OpticalRecovery gated;
+  auto modeStep = [&](uint64_t now, bool tracking = false, bool eligible = true) {
+    return gated.Update(now, ir.Snapshot(), eligible, tracking, display.Snapshot());
+  };
+  assert(modeStep(0).action == Action::None);
+  assert(modeStep(60000000).action == Action::None);
+  display.SetSuspended(false);
+  assert(modeStep(61000000, true).action == Action::None);
+  ir.SetSuspended(true);
+  display.SetSuspended(true);
+  assert(modeStep(62000000).action == Action::None);
+  ir.SetSuspended(false);
+  assert(modeStep(63000000).action == Action::None);
+  assert(modeStep(64400000).action == Action::None);
+  display.SetSuspended(false);
+  assert(modeStep(64400001).action == Action::None);
+  assert(modeStep(64900000).action == Action::None);
+  assert(modeStep(64900001).action == Action::Resync);
+  assert(modeStep(69900001).action == Action::Stalled);
+  assert(modeStep(79900001).action == Action::None);
+  auto modeRecovery = modeStep(80000000, true);
+  assert(modeRecovery.action == Action::Recovered && modeRecovery.resyncIssued);
+  assert(modeRecovery.lossDuration == 15599999);
+
+  // The converse ordering also waits for BOTH sources to be active.
+  ir.SetSuspended(true);
+  display.SetSuspended(true);
+  assert(modeStep(81000000).action == Action::None);
+  display.SetSuspended(false);
+  assert(modeStep(82000000).action == Action::None);
+  assert(modeStep(83000000).action == Action::None);
+  ir.SetSuspended(false);
+  assert(modeStep(84000000).action == Action::None);
+  assert(modeStep(84500000).action == Action::Resync);
+
+  // Even a complete display off/on between controller updates is retained.
+  display.SetSuspended(true);
+  display.SetSuspended(false);
+  assert(modeStep(85000000).action == Action::None);
+  assert(modeStep(85500000).action == Action::Resync);
+  assert(modeStep(85500001, true).action == Action::Recovered);
+  assert(modeStep(86000000).action == Action::None);
+  assert(modeStep(86500000).action == Action::ObserveLoss);
+
+  // Unknown/deactivated mode never reports stale tracking as recovery.
+  display.SetSuspended(true);
+  assert(modeStep(87000000, true).action == Action::None);
+  display.SetSuspended(false);
+  assert(modeStep(88000000, false, false).action == Action::None);
+  assert(modeStep(89000000).action == Action::None);
+  assert(modeStep(89500000).action == Action::ObserveLoss);
+
   std::cout << "OPTICAL_RECOVERY_TESTS_PASSED\n";
 }
