@@ -133,6 +133,9 @@ public:
 
   void SetIsTracking(bool tracking, uint64_t timestamp) {
     std::scoped_lock<std::mutex> lock(this->controllerMutex);
+    if (this->isTracking != tracking) {
+      ++this->trackingTransitionCount;
+    }
     this->isTracking = tracking;
     if (tracking) {
       this->lastTrackedTimestamp = timestamp;
@@ -185,8 +188,23 @@ public:
     return this->hasTimestampOffset;
   }
 
+  struct TrackingDiagnosticSnapshot {
+    bool connected, hasOffset, tracking;
+    uint64_t lastInput, lastTracked, inputCount, transitions, clockResets;
+    int32_t latency;
+    double offset, filteredOffset, averageSample, effectiveDecay;
+  };
+
+  TrackingDiagnosticSnapshot GetTrackingDiagnosticSnapshot() {
+    std::scoped_lock<std::mutex> lock(this->controllerMutex);
+    return {padHandle != -1, hasTimestampOffset, isTracking, lastSampleTimestamp, lastTrackedTimestamp,
+            inputSampleCount, trackingTransitionCount, clockResetCount, offsetLatency,
+            timeStampOffset, filteredOffset, averageSample, currentDecayRate - (k_maxDecayRate / 2.0)};
+  }
+
   void AddTimestampOffsetSample(double sample) {
     std::scoped_lock<std::mutex> lock(this->controllerMutex);
+    ++this->inputSampleCount;
 
     // Average in the new sample with exponential decay.
     // We'll use this as a sanity check to make sure we're not off by a lot.
@@ -196,6 +214,7 @@ public:
 
     // Reset if the average sample is more than 10000 microseconds off or we don't have a timestamp offset
     if (!this->hasTimestampOffset || std::abs(this->filteredOffset - this->averageSample) > 10000.0) {
+      ++this->clockResetCount;
       this->timeStampOffset = sample;
       this->filteredOffset = sample;
       this->averageSample = sample;
@@ -307,6 +326,10 @@ private:
 
   bool isTracking = false;
   uint64_t lastTrackedTimestamp = 0;
+
+  uint64_t inputSampleCount = 0;
+  uint64_t trackingTransitionCount = 0;
+  uint64_t clockResetCount = 0;
 
   int32_t offsetLatency = -1;
 

@@ -4,6 +4,7 @@
 #include "math_helpers.h"
 #include "sense_controller.h"
 #include "sense_crc.h"
+#include "driver_hooks/tracking_diagnostics.h"
 #include "common.h"
 
 #include <algorithm>
@@ -204,6 +205,8 @@ void SenseThread() {
   LARGE_INTEGER start;
   QueryPerformanceCounter(&start);
 
+  TrackingDiagnosticGate resetDiagnostics;
+
   while (hapticsThread) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -258,6 +261,16 @@ void SenseThread() {
       *CaesarManager__resetTrackingFlag = 1;
     }
 
+    // Observe only; Sony owns clearing this shared byte. Sampling cannot prove
+    // absence of sub-tick pulses, and never clears/extends a native reset.
+    const auto driverBase = HmdDriverLoader::Instance()->GetBaseAddress();
+    const int nativeReset = driverBase ? *reinterpret_cast<volatile const uint8_t *>(driverBase + 0x35b9f5) : -1;
+    const auto resetTicks = SenseController::g_ShouldResetLEDTrackingInTicks.load();
+    const uint64_t resetSignature = static_cast<uint64_t>(nativeReset + 1) | (static_cast<uint64_t>(resetTicks != 0) << 9);
+    if (resetDiagnostics.Sample(GetHostTimestamp(), resetSignature, nativeReset > 0 || resetTicks != 0)) {
+      Util::DriverLog("RESET_DIAG nativeFlag={} toolkitTicksRemaining={} (sampled; no reset requested by diagnostic)", nativeReset, resetTicks);
+    }
+
     LONGLONG elapsed = now.QuadPart - start.QuadPart;
 
     // Wait out the duration
@@ -282,6 +295,7 @@ static void PollNextEvent(vr::VREvent_t *pEvent) {
     vr::VREvent_Property_t propertyEvent = *reinterpret_cast<vr::VREvent_Property_t *>(&pEvent->data);
 
     if (propertyEvent.prop == vr::ETrackedDeviceProperty::Prop_DisplayFrequency_Float) {
+      Util::DriverLog("Shared optical reset requested: display-frequency property changed, ticks=150");
       SenseController::g_ShouldResetLEDTrackingInTicks = 150;
     }
 

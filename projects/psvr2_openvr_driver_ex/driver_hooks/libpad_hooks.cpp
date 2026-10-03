@@ -1,6 +1,7 @@
 #include "libpad_hooks.h"
 #include "optical_recovery.h"
 #include "driver_properties_proxy.h"
+#include "tracking_diagnostics.h"
 
 #include "hmd_driver_loader.h"
 #include "utils/hook_lib.h"
@@ -157,6 +158,7 @@ struct ControllerContext {
 
   OpticalActivity opticalActivity;
   OpticalRecovery opticalRecovery;
+  TrackingDiagnosticGate diagnostics;
 };
 static ControllerContext controllerCtx[2];
 std::atomic<int32_t> g_controllerLedCount[2] = {0, 0};
@@ -225,6 +227,14 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
   int32_t controller = isLeft ? 1 : 0;
   char controllerChar = isLeft ? 'L' : 'R';
 
+  // Unknown/truncated inputs remain the native validator's responsibility.
+  // Do not interpret absent fields (notably 2-byte ALL_ON and 7-byte PRESCAN).
+  if (!ledCommand || commandSize < 2 ||
+      !CanInspectLedCommand(static_cast<uint8_t>(ledCommand->type), ledCommand->payload.syncPhase.phase, commandSize)) {
+    libpad_SetSyncLedCommand(timeSync, ledSync, ledCommand, commandSize, isLeft);
+    return;
+  }
+
   if (ledCommand->type == CommandType::SET_SYNC_PHASE) {
     if (ledCommand->payload.syncPhase.phase == LedPhase::LED_ALL_OFF) {
       if (controllerCtx[controller].opticalActivity.SetSuspended(true)) {
@@ -275,33 +285,37 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
     }
 
     if (ledCommand->payload.syncPhase.phase == LedPhase::PRESCAN) {
-      ledCommand->payload.syncPhase.frameCycle = controllerCtx[controller].tunedCycle;
-      Util::DriverLog("[{}] SET_SYNC_PHASE: phase={}, period={}, frameCycle={}, leds=[{},{},{},{}] {}", controllerChar, ledCommand->payload.syncPhase.phase,
-                      ledCommand->payload.syncPhase.period, ledCommand->payload.syncPhase.frameCycle, ledCommand->payload.syncPhase.leds[0],
+      if (PrescanHasFrameCycle(commandSize)) {
+        ledCommand->payload.syncPhase.frameCycle = controllerCtx[controller].tunedCycle;
+      }
+      Util::DriverLog("[{}] SET_SYNC_PHASE: phase={}, period={}, cycleFieldPresent={}, leds=[{},{},{},{}] {}", controllerChar, ledCommand->payload.syncPhase.phase,
+                      ledCommand->payload.syncPhase.period, PrescanHasFrameCycle(commandSize), ledCommand->payload.syncPhase.leds[0],
                       ledCommand->payload.syncPhase.leds[1], ledCommand->payload.syncPhase.leds[2], ledCommand->payload.syncPhase.leds[3], commandSize);
-    } else {
+    } else if (commandSize == 11) {
       Util::DriverLog("[{}] SET_SYNC_PHASE: phase={}, period={}, offset={}, leds=[{},{},{},{}] {}", controllerChar, ledCommand->payload.syncPhase.phase,
                       ledCommand->payload.syncPhase.period, ledCommand->payload.syncPhase.offset, ledCommand->payload.syncPhase.leds[0],
                       ledCommand->payload.syncPhase.leds[1], ledCommand->payload.syncPhase.leds[2], ledCommand->payload.syncPhase.leds[3], commandSize);
+    } else {
+      Util::DriverLog("[{}] SET_SYNC_PHASE: phase={} size={} (no timing fields)", controllerChar, ledCommand->payload.syncPhase.phase, commandSize);
     }
 
     break;
   case CommandType::SET_LEDS_IMMEDIATE:
-    Util::DriverLog("SET_LEDS_IMMEDIATE: leds=[{},{},{},{}]", ledCommand->payload.setLeds.leds[0], ledCommand->payload.setLeds.leds[1],
+    Util::DriverLog("[{}] SET_LEDS_IMMEDIATE: leds=[{},{},{},{}]", controllerChar, ledCommand->payload.setLeds.leds[0], ledCommand->payload.setLeds.leds[1],
                     ledCommand->payload.setLeds.leds[2], ledCommand->payload.setLeds.leds[3]);
     break;
   case CommandType::ADJUST_FRAME_CYCLE:
-    Util::DriverLog("ADJUST_FRAME_CYCLE: adjustmentFactor={}", ledCommand->payload.adjustCycle.adjustmentFactor);
+    Util::DriverLog("[{}] ADJUST_FRAME_CYCLE: adjustmentFactor={}", controllerChar, ledCommand->payload.adjustCycle.adjustmentFactor);
     break;
   case CommandType::ADJUST_BASE_TIME:
-    Util::DriverLog("ADJUST_BASE_TIME: offset={}", ledCommand->payload.adjustTime.offset);
+    Util::DriverLog("[{}] ADJUST_BASE_TIME: offset={}", controllerChar, ledCommand->payload.adjustTime.offset);
     break;
   case CommandType::ADJUST_TIME_AND_CYCLE:
-    Util::DriverLog("ADJUST_TIME_AND_CYCLE: adjustmentFactor={}, offset={}, ledsync.frameCycle={}", ledCommand->payload.adjustTimeAndCycle.adjustmentFactor,
+    Util::DriverLog("[{}] ADJUST_TIME_AND_CYCLE: adjustmentFactor={}, offset={}, ledsync.frameCycle={}", controllerChar, ledCommand->payload.adjustTimeAndCycle.adjustmentFactor,
                     ledCommand->payload.adjustTimeAndCycle.offset, ledSync->frameCycle);
     break;
   case CommandType::SYSTEM_CONTROL:
-    Util::DriverLog("SYSTEM_CONTROL: subCommand={}, subCommandPayload={}", ledCommand->payload.sysControl.subCommand,
+    Util::DriverLog("[{}] SYSTEM_CONTROL: subCommand={}, subCommandPayload={}", controllerChar, ledCommand->payload.sysControl.subCommand,
                     ledCommand->payload.sysControl.subCommandPayload);
     break;
   default:
@@ -309,6 +323,11 @@ void libpad_SetSyncLedCommandHook(LibpadTimeSync *timeSync, LibpadLedSync *ledSy
   }
 
   libpad_SetSyncLedCommand(timeSync, ledSync, ledCommand, commandSize, isLeft);
+  if (ledCommand->type == CommandType::SET_SYNC_PHASE) {
+    Util::DriverLog("[{}] LED_APPLIED source=sony size={} phase={} period={} cycle={} base={} seq={}",
+                    controllerChar, commandSize, static_cast<int>(ledSync->phase), ledSync->period,
+                    ledSync->frameCycle, ledSync->baseTime, ledSync->seq);
+  }
 }
 
 void (*libpad_SetSyncLedBaseTime)(LibpadTimeSync *timeSync, LibpadLedSync *ledSync) = nullptr;
@@ -539,7 +558,12 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
                                      sizeof(command.type) + sizeof(command.payload.syncPhase) - sizeof(command.payload.syncPhase.frameCycle),
                                      senseController.isLeft);
 
-            SenseController::g_ShouldResetLEDTrackingInTicks = 20;
+            // The Sony reset byte is shared: resetting it here also returns the
+            // already-calibrated peer to PRESCAN. Keep only this controller's
+            // existing local LED command; display-frequency resets are unchanged.
+            Util::DriverLog("[{}] Calibration finalized: controller-local PRESCAN only; no shared optical reset. Applied phase={} period={} cycle={} base={} latency={}",
+                            controllerChar, static_cast<int>(controllerLedSync->phase), controllerLedSync->period,
+                            controllerLedSync->frameCycle, controllerLedSync->baseTime, finalOffset);
           }
         }
         break;
@@ -607,6 +631,27 @@ void libpad_SetSyncLedBaseTimeHook(LibpadTimeSync *timeSync, LibpadLedSync *ledS
 
   // This call uses libpad_hostToDevice, which will factor in the updated latencyOffset.
   libpad_SetSyncLedBaseTime(timeSync, ledSync);
+
+  // Sample after the native update, not the requested command payload. Never
+  // read these native pointers from the independent tracking callback thread.
+  const auto diagnostic = senseController.GetTrackingDiagnosticSnapshot();
+  const uint64_t diagnosticNow = GetHostTimestamp();
+  const uint64_t signature = static_cast<uint64_t>(ledSync->phase) |
+      (static_cast<uint64_t>(diagnostic.tracking) << 8) |
+      (static_cast<uint64_t>(diagnostic.connected) << 9) |
+      (static_cast<uint64_t>(diagnostic.hasOffset) << 10) |
+      (static_cast<uint64_t>(static_cast<int>(ctx.state) + 1) << 16);
+  if (ctx.diagnostics.Sample(diagnosticNow, signature, diagnostic.connected)) {
+    Util::DriverLog("[{}] SYNC_DIAG t={} connected={} hasOffset={} tracking={} transitions={} calib={} inputCount={} inputAge={} trackAge={} clockResets={} offset={} filtered={} average={} decay={} latency={} phase={} period={} cycle={} base={} seq={} exposure={} grid={} matchedLeds={} opticalFrames={} displayEpoch={} irEpoch={}",
+                    controllerChar, diagnosticNow, diagnostic.connected, diagnostic.hasOffset, diagnostic.tracking,
+                    diagnostic.transitions, static_cast<int>(ctx.state), diagnostic.inputCount,
+                    DiagnosticAge(diagnosticNow, diagnostic.lastInput), DiagnosticAge(diagnosticNow, diagnostic.lastTracked),
+                    diagnostic.clockResets, diagnostic.offset, diagnostic.filteredOffset, diagnostic.averageSample,
+                    diagnostic.effectiveDecay, diagnostic.latency, static_cast<int>(ledSync->phase), ledSync->period,
+                    ledSync->frameCycle, ledSync->baseTime, ledSync->seq, ledSync->camExposure, ledSync->oneSubGridTime,
+                    g_controllerLedCount[controller].load(), g_opticalFrameIndex[controller].load(), displayActivity,
+                    ctx.opticalActivity.Snapshot());
+  }
 }
 
 void (*logDeviceTrackingState)(void *session, int32_t deviceType, uint64_t timestamp, void *previousPose, void *previousMeta, void *currentPose,
@@ -927,6 +972,7 @@ void LibpadHooks::InstallHooks() {
 
   if (DriverSettings::GetBool(STEAMVR_SETTINGS_USE_TOOLKIT_SYNC, SETTING_USE_TOOLKIT_SYNC_DEFAULT_VALUE)) {
     Util::DriverLog("Using custom controller/LED sync...");
+    Util::DriverLog("Calibration isolation candidate: local finalization, passive per-controller diagnostics v1");
 
     ResolveLibpadSymbols(baseAddress);
 
